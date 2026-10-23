@@ -1,0 +1,410 @@
+name: Fork release
+
+# Manual release of the fork. Rebases the `fork` branch onto an upstream tag,
+# tests, builds macOS arm64 and Windows x64, and publishes a GitHub release
+# `vX.Y.Z-fork.N` with the binaries and the `latest.json` manifest that
+# `herdr update` reads. A rebase conflict fails the run before anything is
+# published.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag to rebase the fork branch onto, for example v0.9.5"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+  UPSTREAM_URL: https://github.com/herdrdev/herdr.git
+  FORK_BRANCH: fork
+
+jobs:
+  prepare:
+    name: Rebase, version and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
+      old_head: ${{ steps.rebase.outputs.old_head }}
+    steps:
+      - name: Check the upstream tag name
+        env:
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          if ! [[ "$UPSTREAM_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "error: upstream_tag must look like v0.9.5, got '$UPSTREAM_TAG'" >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Rebase the fork branch onto the upstream tag
+        id: rebase
+        env:
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          export GIT_EDITOR=true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream "refs/tags/${UPSTREAM_TAG}:refs/tags/${UPSTREAM_TAG}"
+          echo "old_head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          status=0
+          git rebase "refs/tags/${UPSTREAM_TAG}" || status=$?
+          while [ "$status" -ne 0 ]; do
+            if [ ! -d "$(git rev-parse --git-path rebase-merge)" ]; then
+              echo "error: rebase onto ${UPSTREAM_TAG} failed" >&2
+              exit 1
+            fi
+            # Only the version lines and the workflows the fork removed may be
+            # resolved here; any other conflict ends the run unpublished.
+            unresolved=0
+            while IFS= read -r file; do
+              case "$file" in
+                Cargo.toml|Cargo.lock)
+                  git checkout --ours -- "$file"
+                  git add -- "$file"
+                  ;;
+                .github/workflows/*)
+                  git rm -q -f -- "$file"
+                  ;;
+                *)
+                  echo "conflict in $file" >&2
+                  unresolved=1
+                  ;;
+              esac
+            done < <(git diff --name-only --diff-filter=U)
+            if [ "$unresolved" -ne 0 ]; then
+              echo "error: rebase onto ${UPSTREAM_TAG} has conflicts that need a manual rebase" >&2
+              git rebase --abort || true
+              exit 1
+            fi
+            status=0
+            git rebase --continue || status=$?
+          done
+
+      - name: Keep only the fork's own workflows
+        run: |
+          set -euo pipefail
+          for file in .github/workflows/*; do
+            case "$(basename "$file")" in
+              ci.yml|fork-release.yml) ;;
+              *) git rm -q -- "$file" ;;
+            esac
+          done
+          if ! git diff --cached --quiet; then
+            git commit -q -m "chore: drop upstream release workflows"
+          fi
+
+      - name: Set the fork version
+        id: version
+        env:
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          base="${UPSTREAM_TAG#v}"
+
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "${cargo_version%%-*}" != "$base" ]; then
+            echo "note: Cargo.toml says ${cargo_version}, upstream tag is ${base}; the fork version is set from the tag"
+          fi
+
+          last="$(
+            git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/v${base}-fork.*" \
+              | sed -n 's|.*refs/tags/v.*-fork\.\([0-9][0-9]*\)$|\1|p' \
+              | sort -n | tail -1
+          )"
+          number=$(( ${last:-0} + 1 ))
+          version="${base}-fork.${number}"
+          tag="v${version}"
+
+          V="$version" perl -0pi -e 's/^version = "[^"]*"/version = "$ENV{V}"/m' Cargo.toml
+          V="$version" perl -0pi -e 's/(\[\[package\]\]\nname = "herdr"\nversion = ")[^"]*"/$1$ENV{V}"/' Cargo.lock
+          if ! git diff --quiet; then
+            git add Cargo.toml Cargo.lock
+            git commit -q -m "chore: fork version ${version}"
+          fi
+          grep -q "^version = \"${version}\"$" Cargo.toml
+          if ! grep -A1 '^name = "herdr"$' Cargo.lock | grep -q "^version = \"${version}\"$"; then
+            echo "error: Cargo.lock does not carry ${version}" >&2
+            exit 1
+          fi
+
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "commit=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          git bundle create "$RUNNER_TEMP/fork-source.bundle" "${FORK_BRANCH}"
+
+      - name: Upload the rebased source
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fork-source
+          path: ${{ runner.temp }}/fork-source.bundle
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: fork-release-test
+
+      - name: Test
+        run: cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: prepare
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: herdr-macos-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            name: herdr-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      LIBGHOSTTY_VT_OPTIMIZE: ReleaseFast
+      LIBGHOSTTY_VT_SIMD: "true"
+      RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Download the rebased source
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fork-source
+          path: ${{ runner.temp }}/source
+
+      - name: Check out the rebased source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --branch "$FORK_BRANCH" "$RUNNER_TEMP/source/fork-source.bundle" src
+          test "$(git -C src rev-parse HEAD)" = "$RELEASE_COMMIT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install cmake ninja
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          workspaces: src
+          key: fork-release-${{ matrix.target }}
+
+      - name: Remove Zig caches
+        shell: bash
+        working-directory: src
+        run: rm -rf .zig-cache vendor/libghostty-vt/.zig-cache vendor/libghostty-vt/zig-out
+
+      - name: Build
+        working-directory: src
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
+          # The macOS runner can run the arm64 binary it just built.
+          version="$(./${{ matrix.name }} --version | tr -d '\r')"
+          case "$version" in
+            *"$RELEASE_VERSION"*) ;;
+            *) echo "error: binary reports '$version', expected $RELEASE_VERSION" >&2; exit 1 ;;
+          esac
+
+      - name: Package artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: src
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg"
+          $stage = Join-Path $env:RUNNER_TEMP "herdr-windows-x86_64"
+          .\scripts\package_windows_conpty.ps1 `
+            -HerdrExe target\${{ matrix.target }}\release\herdr.exe `
+            -PackagePath $package `
+            -StageDir $stage `
+            -OutputPath ${{ matrix.name }}
+          $version = (& (Join-Path $stage "herdr.exe") --version | Out-String).Trim()
+          if ($version -notmatch [regex]::Escape($env:RELEASE_VERSION) -or $version -match "preview") {
+            throw "Packaged Windows binary has unexpected version identity: $version"
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: src/${{ matrix.name }}
+
+  publish:
+    name: Publish the release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Pushing rebased upstream commits that touch workflow files needs a token
+      # with the `workflow` scope; without the secret the default token is used.
+      PUSH_TOKEN: ${{ secrets.FORK_PUSH_TOKEN || github.token }}
+      RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      OLD_HEAD: ${{ needs.prepare.outputs.old_head }}
+      UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+    steps:
+      - name: Download the rebased source
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: fork-source
+          path: ${{ runner.temp }}/source
+
+      - name: Download the binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: herdr-*
+          path: ${{ runner.temp }}/assets
+          merge-multiple: true
+
+      - name: Push the rebased branch and the release tag
+        run: |
+          set -euo pipefail
+          git clone --quiet --branch "$FORK_BRANCH" "$RUNNER_TEMP/source/fork-source.bundle" src
+          cd src
+          test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          git remote set-url origin "https://x-access-token:${PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if [ "$RELEASE_COMMIT" != "$OLD_HEAD" ]; then
+            if ! git push --force-with-lease="refs/heads/${FORK_BRANCH}:${OLD_HEAD}" origin "HEAD:refs/heads/${FORK_BRANCH}"; then
+              echo "error: could not push the rebased ${FORK_BRANCH} branch. If GitHub refused workflow changes, add a FORK_PUSH_TOKEN secret with the workflow scope, or rebase and push the branch by hand and run again." >&2
+              exit 1
+            fi
+          fi
+          git tag "$RELEASE_TAG" "$RELEASE_COMMIT"
+          git push origin "refs/tags/${RELEASE_TAG}"
+
+      - name: Write the manifest and release notes
+        run: |
+          set -euo pipefail
+          cd src
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+          protocol="$(python3 -c 'import re, sys; m = re.search(r"pub const PROTOCOL_VERSION: u32 = (\d+);", open("src/protocol/wire.rs").read()); sys.exit(1) if m is None else print(m.group(1))')"
+          generation="$(python3 -c 'import re, sys; m = re.search(r"pub const ENDPOINT_PROTOCOL_GENERATION: u32 = (\d+);", open("src/protocol/endpoint.rs").read()); sys.exit(1) if m is None else print(m.group(1))')"
+          {
+            echo "Fork of herdr ${UPSTREAM_TAG} (commit ${RELEASE_COMMIT:0:12}) that lets several clients attach to one terminal."
+            echo
+            echo "Binaries: macOS arm64 and Windows x64. \`herdr update\` on the fork reads \`latest.json\` from the latest release."
+          } > "$RUNNER_TEMP/notes.md"
+          export BASE_URL="$base_url" PROTOCOL="$protocol" GENERATION="$generation" NOTES_PATH="$RUNNER_TEMP/notes.md" ASSETS_DIR="$RUNNER_TEMP/assets" MANIFEST_PATH="$RUNNER_TEMP/latest.json"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+
+          assets_dir = pathlib.Path(os.environ["ASSETS_DIR"])
+          files = {
+              "macos-aarch64": "herdr-macos-aarch64",
+              "windows-x86_64": "herdr-windows-x86_64.zip",
+          }
+          notes = pathlib.Path(os.environ["NOTES_PATH"]).read_text().strip()
+          assets = {}
+          sha256 = {}
+          for key, name in files.items():
+              path = assets_dir / name
+              if not path.is_file():
+                  raise SystemExit(f"missing build artifact {name}")
+              assets[key] = f"{os.environ['BASE_URL']}/{name}"
+              sha256[key] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+          version = os.environ["RELEASE_VERSION"]
+          protocol = int(os.environ["PROTOCOL"])
+          generation = int(os.environ["GENERATION"])
+          manifest = {
+              "version": version,
+              "protocol": protocol,
+              "endpoint_generation": generation,
+              "notes": notes,
+              "assets": assets,
+              "sha256": sha256,
+              "releases": {
+                  version: {
+                      "notes": notes,
+                      "protocol": protocol,
+                      "endpoint_generation": generation,
+                      "assets": assets,
+                      "sha256": sha256,
+                  }
+              },
+          }
+          pathlib.Path(os.environ["MANIFEST_PATH"]).write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+          cat "$RUNNER_TEMP/latest.json"
+
+      - name: Create the release
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --latest \
+            --title "$RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "$RUNNER_TEMP/assets/herdr-macos-aarch64" \
+            "$RUNNER_TEMP/assets/herdr-windows-x86_64.zip" \
+            "$RUNNER_TEMP/latest.json"

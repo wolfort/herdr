@@ -1,6 +1,6 @@
 //! Self-update mechanism.
 //!
-//! Checks the hosted herdr.dev update manifest for newer versions.
+//! Checks the fork's release manifest on GitHub for newer versions.
 //! Manual `herdr update` downloads and installs the binary.
 //! Background checks only surface availability and release notes.
 //! Uses `curl` as a subprocess for HTTP — no additional Rust HTTP dependencies.
@@ -22,8 +22,10 @@ use std::time::{Duration, Instant};
 use interprocess::local_socket::traits::Stream as _;
 use serde::{Deserialize, Deserializer};
 
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
+const STABLE_UPDATE_MANIFEST_URL: &str =
+    "https://github.com/wolfort/herdr/releases/latest/download/latest.json";
+/// This fork publishes no preview builds, so the preview channel is refused.
+const PREVIEW_CHANNEL_UNAVAILABLE: &str = "preview channel not available";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
@@ -61,18 +63,25 @@ fn fake_release_notes_body(version: &str) -> String {
 // Version
 // ---------------------------------------------------------------------------
 
-/// Parsed semver version for comparison.
+/// Parsed version for comparison: three numbers and an optional `-fork.N`
+/// suffix. A build without the suffix sorts below the same numbers with one,
+/// and `-fork.N` releases of the same numbers sort by `N`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version {
     pub major: u32,
     pub minor: u32,
     pub patch: u32,
+    pub fork: Option<u32>,
 }
 
 impl Version {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.strip_prefix('v').unwrap_or(s);
-        let parts: Vec<&str> = s.split('.').collect();
+        let (numbers, fork) = match s.split_once("-fork.") {
+            Some((numbers, fork)) => (numbers, Some(parse_fork_number(fork)?)),
+            None => (s, None),
+        };
+        let parts: Vec<&str> = numbers.split('.').collect();
         if parts.len() != 3 {
             return None;
         }
@@ -80,6 +89,7 @@ impl Version {
             major: parts[0].parse().ok()?,
             minor: parts[1].parse().ok()?,
             patch: parts[2].parse().ok()?,
+            fork,
         })
     }
 
@@ -88,9 +98,21 @@ impl Version {
     }
 }
 
+/// Fork release numbers start at 1 and are plain digits.
+fn parse_fork_number(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok().filter(|number| *number >= 1)
+}
+
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if let Some(fork) = self.fork {
+            write!(f, "-fork.{fork}")?;
+        }
+        Ok(())
     }
 }
 
@@ -329,8 +351,8 @@ fn fetch_update_manifest() -> Result<UpdateManifest, String> {
     fetch_json_manifest(STABLE_UPDATE_MANIFEST_URL)
 }
 
-fn fetch_preview_manifest() -> Result<PreviewManifest, String> {
-    fetch_json_manifest(PREVIEW_UPDATE_MANIFEST_URL)
+fn channel_rejection(channel: UpdateChannel) -> Option<&'static str> {
+    (channel == UpdateChannel::Preview).then_some(PREVIEW_CHANNEL_UNAVAILABLE)
 }
 
 fn fetch_json_manifest<T>(url: &str) -> Result<T, String>
@@ -382,11 +404,22 @@ fn handle_manifest_announcement(version: &str, value: Option<&serde_json::Value>
 }
 
 fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<ReleaseInfo>, String> {
-    let current = Version::current();
+    release_info_for_installed(
+        manifest,
+        &Version::current(),
+        crate::build_info::is_preview(),
+    )
+}
+
+fn release_info_for_installed(
+    manifest: &UpdateManifest,
+    current: &Version,
+    installed_is_preview: bool,
+) -> Result<Option<ReleaseInfo>, String> {
     let latest = Version::parse(&manifest.version)
         .ok_or_else(|| format!("invalid version in update manifest: {}", manifest.version))?;
 
-    if !stable_channel_should_install(&latest, &current, crate::build_info::is_preview()) {
+    if !stable_channel_should_install(&latest, current, installed_is_preview) {
         return Ok(None); // up to date
     }
 
@@ -439,6 +472,9 @@ fn stable_channel_should_install(
     installed_is_preview || latest > current
 }
 
+// Preview parsing is kept as upstream has it so rebases stay conflict-free;
+// the fork never fetches a preview manifest.
+#[allow(dead_code)]
 fn preview_display_version(base_version: &str, build_id: &str) -> String {
     format!(
         "{}-preview.{}",
@@ -447,6 +483,7 @@ fn preview_display_version(base_version: &str, build_id: &str) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn release_info_from_preview_manifest(
     manifest: &PreviewManifest,
 ) -> Result<Option<ReleaseInfo>, String> {
@@ -531,9 +568,8 @@ fn first_windows_stable_is_pending(
 }
 
 fn check_latest() -> Result<Option<ReleaseInfo>, String> {
-    let channel = UpdateChannel::configured();
-    if channel == UpdateChannel::Preview {
-        return release_info_from_preview_manifest(&fetch_preview_manifest()?);
+    if let Some(rejection) = channel_rejection(UpdateChannel::configured()) {
+        return Err(rejection.into());
     }
 
     let manifest = fetch_update_manifest()?;
@@ -2146,6 +2182,10 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         return Err("run `herdr update` outside herdr after detaching from the session".into());
     }
 
+    if let Some(rejection) = channel_rejection(channel) {
+        return Err(rejection.into());
+    }
+
     eprintln!("checking {} channel for updates...", channel.as_str());
 
     let current = Version::current();
@@ -2706,7 +2746,8 @@ mod tests {
             Some(Version {
                 major: 1,
                 minor: 2,
-                patch: 3
+                patch: 3,
+                fork: None
             })
         );
     }
@@ -2718,7 +2759,8 @@ mod tests {
             Some(Version {
                 major: 0,
                 minor: 1,
-                patch: 0
+                patch: 0,
+                fork: None
             })
         );
     }
@@ -3599,8 +3641,147 @@ mod tests {
             major: 0,
             minor: 1,
             patch: 0,
+            fork: None,
         };
         assert_eq!(v.to_string(), "0.1.0");
+    }
+
+    #[test]
+    fn fork_version_parses_and_displays_in_full() {
+        let v = Version::parse("0.9.5-fork.1").unwrap();
+        assert_eq!(
+            v,
+            Version {
+                major: 0,
+                minor: 9,
+                patch: 5,
+                fork: Some(1)
+            }
+        );
+        assert_eq!(v.to_string(), "0.9.5-fork.1");
+        assert_eq!(
+            Version::parse("v0.9.5-fork.12").unwrap().to_string(),
+            "0.9.5-fork.12"
+        );
+    }
+
+    #[test]
+    fn fork_version_rejects_malformed_suffixes() {
+        for input in [
+            "0.9.5-fork.",
+            "0.9.5-fork.0",
+            "0.9.5-fork.x",
+            "0.9.5-fork.1.2",
+            "0.9.5-fork.-1",
+            "0.9.5-fork.+1",
+            "0.9-fork.1",
+            "0.9.5-preview.1",
+        ] {
+            assert_eq!(Version::parse(input), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn fork_version_ordering() {
+        let v = |input: &str| Version::parse(input).unwrap();
+
+        assert!(v("0.9.5-fork.1") < v("0.9.5-fork.2"));
+        assert!(v("0.9.5-fork.2") < v("0.9.5-fork.10"));
+        assert!(v("0.9.5-fork.2") < v("0.9.6-fork.1"));
+        assert!(v("0.9.5") < v("0.9.5-fork.1"));
+        assert!(v("0.9.5-fork.9") < v("0.9.6"));
+        assert!(v("0.9.5-fork.1") == v("v0.9.5-fork.1"));
+    }
+
+    #[test]
+    fn current_version_is_the_cargo_version_in_full() {
+        // Version::current() must not panic on the `-fork.N` suffix and must
+        // keep the suffix, since the updater compares and displays it.
+        let current = Version::current();
+        assert_eq!(current.to_string(), crate::build_info::BASE_VERSION);
+        assert!(
+            current.fork.is_some(),
+            "fork builds carry -fork.N in Cargo.toml"
+        );
+    }
+
+    fn fork_manifest(version: &str) -> UpdateManifest {
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let json = format!(
+            r####"{{
+                "version": "{version}",
+                "protocol": 4,
+                "endpoint_generation": 1,
+                "notes": "### Changed\n- Fork build",
+                "assets": {{
+                    "{asset_key}": "https://example.com/herdr"
+                }},
+                "sha256": {{
+                    "{asset_key}": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }}
+            }}"####
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn fork_manifest_offers_the_next_fork_release() {
+        let current = Version::parse("0.9.5-fork.1").unwrap();
+        let release = release_info_for_installed(&fork_manifest("0.9.5-fork.2"), &current, false)
+            .unwrap()
+            .expect("fork.2 is newer than fork.1");
+
+        assert_eq!(release.version, Version::parse("0.9.5-fork.2").unwrap());
+        assert_eq!(release.identity, "0.9.5-fork.2");
+        assert_eq!(release.label(), "0.9.5-fork.2");
+        assert_eq!(release.channel, UpdateChannel::Stable);
+
+        let next_base = release_info_for_installed(&fork_manifest("0.9.6-fork.1"), &current, false)
+            .unwrap()
+            .expect("a newer base version is newer");
+        assert_eq!(next_base.identity, "0.9.6-fork.1");
+    }
+
+    #[test]
+    fn fork_manifest_is_quiet_when_installed_release_is_current() {
+        let manifest = fork_manifest("0.9.5-fork.2");
+        for installed in ["0.9.5-fork.2", "0.9.5-fork.3", "0.9.6-fork.1"] {
+            let current = Version::parse(installed).unwrap();
+            assert!(release_info_for_installed(&manifest, &current, false)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn fork_manifest_notes_resolve_for_the_full_version() {
+        let manifest = fork_manifest("0.9.5-fork.2");
+        let metadata = manifest
+            .metadata_for_version(&Version::parse("0.9.5-fork.2").unwrap())
+            .expect("notes for the manifest version");
+        assert_eq!(metadata.notes_body(), "### Changed\n- Fork build");
+        assert!(manifest
+            .metadata_for_version(&Version::parse("0.9.5-fork.1").unwrap())
+            .is_none());
+    }
+
+    #[test]
+    fn stable_manifest_url_points_at_the_fork_releases() {
+        assert_eq!(
+            STABLE_UPDATE_MANIFEST_URL,
+            "https://github.com/wolfort/herdr/releases/latest/download/latest.json"
+        );
+        assert!(!STABLE_UPDATE_MANIFEST_URL.contains("herdr.dev"));
+    }
+
+    #[test]
+    fn preview_channel_is_not_available_in_the_fork() {
+        assert_eq!(
+            channel_rejection(UpdateChannel::Preview),
+            Some("preview channel not available")
+        );
+        assert_eq!(channel_rejection(UpdateChannel::Stable), None);
     }
 
     #[test]

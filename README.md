@@ -1,5 +1,9 @@
 # herdr
 
+> This is a fork of [herdr](https://github.com/herdrdev/herdr) with fixes that let several clients attach to one terminal; `herdr update` in this fork reads its releases (`vX.Y.Z-fork.N`) from this repository.
+>
+> Build: install Rust (the version in `rust-toolchain.toml`), Zig 0.16.0, `cmake` and `ninja`, then run `cargo build --release` (set `ZIG` to the `zig` binary when it is not on `PATH`); the binary is `target/release/herdr`. Releases come from the manual `Fork release` workflow.
+
 
 <p align="center">
   <img src="assets/logo.png" alt="herdr" width="100" />
