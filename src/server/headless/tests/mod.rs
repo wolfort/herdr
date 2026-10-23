@@ -4175,6 +4175,78 @@ fn terminal_observers_wait_for_synchronized_output_with_or_without_baseline() {
     });
 }
 
+fn attach_client_ids(server: &HeadlessServer, terminal_id: &str) -> Vec<u64> {
+    server
+        .terminal_attach_owners
+        .get(terminal_id)
+        .map(|attached| attached.clients.clone())
+        .unwrap_or_default()
+}
+
+fn attach_active_client(server: &HeadlessServer, terminal_id: &str) -> Option<u64> {
+    server
+        .terminal_attach_owners
+        .get(terminal_id)
+        .and_then(TerminalAttachClients::active)
+}
+
+fn control_terminal(
+    server: &mut HeadlessServer,
+    client_id: u64,
+    target: &str,
+    takeover: bool,
+) -> bool {
+    server.handle_server_event(ServerEvent::ClientControlTerminal {
+        client_id,
+        target: target.to_owned(),
+        takeover,
+    })
+}
+
+/// Connects a pending terminal client of the given size and returns its
+/// control and render receivers.
+fn connect_sized_terminal_client(
+    server: &mut HeadlessServer,
+    client_id: u64,
+    cols: u16,
+    rows: u16,
+) -> (
+    std::sync::mpsc::Receiver<Vec<u8>>,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let (writer, control_rx, render_rx) = test_client_writer();
+    assert!(!server.handle_server_event(ServerEvent::ClientConnected {
+        client_id,
+        cols,
+        rows,
+        cell_width_px: 0,
+        cell_height_px: 0,
+        pixel_mouse: false,
+        writer,
+    }));
+    (control_rx, render_rx)
+}
+
+fn runtime_rows_cols(
+    server: &HeadlessServer,
+    terminal_id: &crate::terminal::TerminalId,
+) -> (u16, u16) {
+    server
+        .app
+        .terminal_runtimes
+        .get(terminal_id)
+        .expect("runtime")
+        .current_size()
+}
+
+fn assert_no_shutdown(control: &std::sync::mpsc::Receiver<Vec<u8>>) {
+    for bytes in control.try_iter() {
+        if let ServerMessage::ServerShutdown { reason } = read_server_message(bytes) {
+            panic!("unexpected shutdown: {reason:?}");
+        }
+    }
+}
+
 fn connect_pending_terminal_client(server: &mut HeadlessServer, client_id: u64) {
     let _control_rx = connect_pending_terminal_client_with_control_rx(server, client_id);
 }
@@ -4524,10 +4596,7 @@ fn terminal_control_resolves_public_pane_id_and_takes_ownership() {
             Some(ClientConnectionMode::TerminalAttach { terminal_id: attached })
                 if attached == &terminal_id_string
         ));
-        assert_eq!(
-            server.terminal_attach_owners.get(&terminal_id_string),
-            Some(&7)
-        );
+        assert_eq!(attach_client_ids(server, &terminal_id_string), vec![7]);
         assert!(server
             .app
             .state
@@ -4590,32 +4659,301 @@ fn terminal_control_rejects_attach_during_alt_screen_read() {
 }
 
 #[test]
-fn terminal_control_rejects_second_controller_without_takeover() {
-    with_terminal_session_test_server(|server, _terminal_id, terminal_id_string, _| {
-        connect_pending_terminal_client(server, 7);
-        assert!(
-            server.handle_server_event(ServerEvent::ClientControlTerminal {
-                client_id: 7,
-                target: terminal_id_string.clone(),
-                takeover: false,
-            })
-        );
+fn terminal_control_second_controller_joins_without_takeover() {
+    with_terminal_session_test_server(|server, terminal_id, terminal_id_string, _| {
+        let first_control = connect_pending_terminal_client_with_control_rx(server, 7);
+        assert!(control_terminal(server, 7, &terminal_id_string, false));
 
-        connect_pending_terminal_client(server, 8);
-        assert!(
-            !server.handle_server_event(ServerEvent::ClientControlTerminal {
-                client_id: 8,
-                target: terminal_id_string.clone(),
-                takeover: false,
-            })
-        );
+        let second_control = connect_pending_terminal_client_with_control_rx(server, 8);
+        assert!(control_terminal(server, 8, &terminal_id_string, false));
 
         assert!(server.clients.contains_key(&7));
-        assert!(!server.clients.contains_key(&8));
+        assert!(server.clients.contains_key(&8));
+        assert_no_shutdown(&first_control);
+        assert_no_shutdown(&second_control);
+        assert_eq!(attach_client_ids(server, &terminal_id_string), vec![8, 7]);
+        assert_eq!(attach_active_client(server, &terminal_id_string), Some(7));
+        assert!(server
+            .app
+            .state
+            .direct_attach_resize_locks
+            .contains(&terminal_id));
+    });
+}
+
+#[test]
+fn two_terminal_controllers_both_receive_frames_and_both_write() {
+    with_terminal_session_test_server(|server, terminal_id, target, _| {
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        let (first_control, first_frames) = connect_sized_terminal_client(server, 7, 100, 30);
+        let (second_control, second_frames) = connect_sized_terminal_client(server, 8, 100, 30);
+        assert!(control_terminal(server, 7, &target, false));
+        assert!(control_terminal(server, 8, &target, false));
+
+        server
+            .app
+            .terminal_runtimes
+            .get(&terminal_id)
+            .expect("runtime")
+            .test_process_pty_bytes(b"SHARED");
+        server.render_and_stream();
+        for frames in [&first_frames, &second_frames] {
+            let ServerMessage::Terminal(frame) = read_server_message(
+                frames
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("terminal frame"),
+            ) else {
+                panic!("expected terminal frame");
+            };
+            assert!(String::from_utf8_lossy(&frame.bytes).contains("SHARED"));
+        }
+
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 7,
+            data: b"a".to_vec(),
+        }));
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 8,
+            data: b"b".to_vec(),
+        }));
         assert_eq!(
-            server.terminal_attach_owners.get(&terminal_id_string),
-            Some(&7)
+            input_rx.try_recv().expect("first input"),
+            Bytes::from_static(b"a")
         );
+        assert_eq!(
+            input_rx.try_recv().expect("second input"),
+            Bytes::from_static(b"b")
+        );
+        assert_no_shutdown(&first_control);
+        assert_no_shutdown(&second_control);
+        assert_eq!(attach_client_ids(server, &target), vec![7, 8]);
+    });
+}
+
+#[test]
+fn terminal_control_takeover_disconnects_every_other_controller() {
+    with_terminal_session_test_server(|server, terminal_id, target, _| {
+        let first_control = connect_pending_terminal_client_with_control_rx(server, 7);
+        assert!(control_terminal(server, 7, &target, false));
+        let second_control = connect_pending_terminal_client_with_control_rx(server, 8);
+        assert!(control_terminal(server, 8, &target, false));
+        let observer_control = connect_pending_terminal_client_with_control_rx(server, 9);
+        assert!(
+            server.handle_server_event(ServerEvent::ClientObserveTerminal {
+                client_id: 9,
+                target: target.clone(),
+            })
+        );
+
+        connect_pending_terminal_client(server, 10);
+        assert!(control_terminal(server, 10, &target, true));
+
+        for control in [&first_control, &second_control] {
+            let reason = read_server_shutdown_reason(control.recv().expect("shutdown message"));
+            assert_eq!(reason, Some("terminal attach taken over".to_owned()));
+        }
+        assert!(!server.clients.contains_key(&7));
+        assert!(!server.clients.contains_key(&8));
+        assert!(server.clients.contains_key(&9));
+        assert_no_shutdown(&observer_control);
+        assert_eq!(attach_client_ids(server, &target), vec![10]);
+        assert!(server
+            .app
+            .state
+            .direct_attach_resize_locks
+            .contains(&terminal_id));
+    });
+}
+
+#[test]
+fn terminal_controller_disconnect_keeps_terminal_for_remaining_controller() {
+    with_terminal_session_test_server(|server, terminal_id, target, _| {
+        let first_control = connect_pending_terminal_client_with_control_rx(server, 7);
+        assert!(control_terminal(server, 7, &target, false));
+        connect_pending_terminal_client(server, 8);
+        assert!(control_terminal(server, 8, &target, false));
+
+        assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 8 }));
+
+        assert!(server.clients.contains_key(&7));
+        assert_no_shutdown(&first_control);
+        assert_eq!(attach_client_ids(server, &target), vec![7]);
+        assert!(server.terminal_has_attach_client(&target));
+        assert!(server
+            .app
+            .state
+            .direct_attach_resize_locks
+            .contains(&terminal_id));
+
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 7,
+            data: b"a".to_vec(),
+        }));
+        assert!(server.clients.contains_key(&7));
+    });
+}
+
+#[test]
+fn terminal_attach_single_client_follows_its_resize() {
+    with_terminal_session_test_server(|server, terminal_id, target, _| {
+        let _control = connect_sized_terminal_client(server, 7, 100, 30);
+        assert!(control_terminal(server, 7, &target, false));
+        assert_eq!(runtime_rows_cols(server, &terminal_id), (30, 100));
+
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 7,
+            cols: 90,
+            rows: 28,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+        }));
+
+        assert_eq!(runtime_rows_cols(server, &terminal_id), (28, 90));
+    });
+}
+
+#[test]
+fn terminal_input_from_other_sized_controller_takes_terminal_size() {
+    with_terminal_session_test_server(|server, terminal_id, target, _| {
+        let _first = connect_sized_terminal_client(server, 7, 100, 30);
+        assert!(control_terminal(server, 7, &target, false));
+        let _second = connect_sized_terminal_client(server, 8, 80, 24);
+        assert!(control_terminal(server, 8, &target, false));
+        assert_eq!(
+            runtime_rows_cols(server, &terminal_id),
+            (30, 100),
+            "a joining client keeps the size of the first"
+        );
+
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 8,
+            data: b"x".to_vec(),
+        }));
+        assert_eq!(runtime_rows_cols(server, &terminal_id), (24, 80));
+        assert_eq!(attach_active_client(server, &target), Some(8));
+
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 7,
+            data: b"y".to_vec(),
+        }));
+        assert_eq!(runtime_rows_cols(server, &terminal_id), (30, 100));
+
+        for focus_report in [b"\x1b[I", b"\x1b[O"] {
+            assert!(server.handle_server_event(ServerEvent::ClientInput {
+                client_id: 8,
+                data: focus_report.to_vec(),
+            }));
+        }
+        assert_eq!(
+            runtime_rows_cols(server, &terminal_id),
+            (30, 100),
+            "a focus report alone does not claim the terminal size"
+        );
+
+        let mouse = |kind| ServerEvent::ClientAttachMouse {
+            client_id: 8,
+            kind,
+            position: protocol::ClientMousePosition::Cell { column: 1, row: 1 },
+            geometry: None,
+            modifiers: 0,
+            lines: 1,
+        };
+        for passive in [
+            protocol::ClientMouseKind::Moved,
+            protocol::ClientMouseKind::ScrollDown,
+            protocol::ClientMouseKind::Up(protocol::ClientMouseButton::Left),
+        ] {
+            let _ = server.handle_server_event(mouse(passive));
+        }
+        assert_eq!(runtime_rows_cols(server, &terminal_id), (30, 100));
+        assert_eq!(attach_active_client(server, &target), Some(7));
+
+        let _ = server.handle_server_event(mouse(protocol::ClientMouseKind::Down(
+            protocol::ClientMouseButton::Left,
+        )));
+        assert_eq!(runtime_rows_cols(server, &terminal_id), (24, 80));
+        assert_eq!(attach_active_client(server, &target), Some(8));
+    });
+}
+
+#[test]
+fn inactive_terminal_controller_resize_keeps_terminal_size() {
+    with_terminal_session_test_server(|server, terminal_id, target, _| {
+        let _first = connect_sized_terminal_client(server, 7, 100, 30);
+        assert!(control_terminal(server, 7, &target, false));
+        let _second = connect_sized_terminal_client(server, 8, 80, 24);
+        assert!(control_terminal(server, 8, &target, false));
+
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 8,
+            cols: 60,
+            rows: 20,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+        }));
+        assert_eq!(runtime_rows_cols(server, &terminal_id), (30, 100));
+        assert_eq!(server.clients[&8].terminal_size, (60, 20));
+
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 7,
+            cols: 120,
+            rows: 40,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+        }));
+        assert_eq!(runtime_rows_cols(server, &terminal_id), (40, 120));
+
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 8,
+            data: b"x".to_vec(),
+        }));
+        assert_eq!(
+            runtime_rows_cols(server, &terminal_id),
+            (20, 60),
+            "input applies the size the inactive client last reported"
+        );
+    });
+}
+
+#[test]
+fn active_terminal_controller_leaving_passes_size_and_keeps_lock() {
+    with_terminal_session_test_server(|server, terminal_id, target, _| {
+        let _first = connect_sized_terminal_client(server, 7, 100, 30);
+        assert!(control_terminal(server, 7, &target, false));
+        let _second = connect_sized_terminal_client(server, 8, 80, 24);
+        assert!(control_terminal(server, 8, &target, false));
+        assert!(server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 8,
+            data: b"x".to_vec(),
+        }));
+        assert_eq!(runtime_rows_cols(server, &terminal_id), (24, 80));
+
+        assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 8 }));
+
+        assert_eq!(attach_client_ids(server, &target), vec![7]);
+        assert_eq!(attach_active_client(server, &target), Some(7));
+        assert_eq!(runtime_rows_cols(server, &terminal_id), (30, 100));
+        assert!(server
+            .app
+            .state
+            .direct_attach_resize_locks
+            .contains(&terminal_id));
+
+        assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 7 }));
+
+        assert!(server.terminal_attach_owners.is_empty());
+        assert!(!server
+            .app
+            .state
+            .direct_attach_resize_locks
+            .contains(&terminal_id));
     });
 }
 
@@ -4642,10 +4980,7 @@ fn terminal_control_takeover_replaces_existing_controller() {
 
         assert!(!server.clients.contains_key(&7));
         assert!(server.clients.contains_key(&8));
-        assert_eq!(
-            server.terminal_attach_owners.get(&terminal_id_string),
-            Some(&8)
-        );
+        assert_eq!(attach_client_ids(server, &terminal_id_string), vec![8]);
     });
 }
 
@@ -4669,10 +5004,7 @@ fn terminal_observe_can_coexist_with_terminal_control() {
             })
         );
 
-        assert_eq!(
-            server.terminal_attach_owners.get(&terminal_id_string),
-            Some(&7)
-        );
+        assert_eq!(attach_client_ids(server, &terminal_id_string), vec![7]);
         assert!(matches!(
             server.clients.get(&8).map(|client| &client.mode),
             Some(ClientConnectionMode::TerminalObserve { terminal_id })
@@ -4747,10 +5079,7 @@ fn terminal_attach_rejects_later_observe_and_clears_ownership() {
                 takeover: false,
             })
         );
-        assert_eq!(
-            server.terminal_attach_owners.get(&terminal_id_string),
-            Some(&7)
-        );
+        assert_eq!(attach_client_ids(server, &terminal_id_string), vec![7]);
         assert!(server
             .app
             .state
@@ -5264,7 +5593,7 @@ fn terminal_attach_client_exits_when_worktree_runtime_restore_fails() {
             takeover: false,
         })
     );
-    assert_eq!(server.terminal_attach_owners.get(&terminal_id), Some(&7));
+    assert_eq!(attach_client_ids(&server, &terminal_id), vec![7]);
     server
         .app
         .pending_worktree_remove_runtime_exits
@@ -6234,6 +6563,11 @@ fn terminal_attach_resize_uses_known_cell_geometry_without_pixel_mouse() {
             terminal_id: terminal_id.clone(),
         };
         server.clients.insert(1, client);
+        server
+            .terminal_attach_owners
+            .entry(terminal_id.clone())
+            .or_default()
+            .join(1);
 
         assert!(server.handle_server_event(ServerEvent::ClientResize {
             client_id: 1,

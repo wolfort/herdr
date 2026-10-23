@@ -228,8 +228,9 @@ pub struct HeadlessServer {
     server_config_diagnostic: Option<String>,
     /// Server config warning with keybinding diagnostics removed for local-keybinding clients.
     server_config_diagnostic_without_keybindings: Option<String>,
-    /// Writable direct attach owner per terminal id string.
-    terminal_attach_owners: HashMap<String, u64>,
+    /// Writable direct attach clients per terminal id string. An entry is
+    /// removed with its last client, so a present entry is never empty.
+    terminal_attach_owners: HashMap<String, TerminalAttachClients>,
     /// Deferred application-history reads currently driving alternate-screen viewports.
     pending_alt_screen_reads: Vec<crate::server::alt_screen_read::PendingAltScreenRead>,
     /// Reads waiting for an alternate-screen traversal of the same terminal to finish.
@@ -260,6 +261,78 @@ pub struct HeadlessServer {
     server_event_rx: mpsc::Receiver<ServerEvent>,
     /// Sender for server events (cloned for each client thread).
     server_event_tx: mpsc::Sender<ServerEvent>,
+}
+
+/// Writable direct attach clients of one terminal, ordered from least to most
+/// recently active. The last client is the active one: the terminal follows
+/// its size until another attached client sends input.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TerminalAttachClients {
+    clients: Vec<u64>,
+}
+
+impl TerminalAttachClients {
+    fn active(&self) -> Option<u64> {
+        self.clients.last().copied()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.clients.is_empty()
+    }
+
+    fn contains(&self, client_id: u64) -> bool {
+        self.clients.contains(&client_id)
+    }
+
+    fn is_active(&self, client_id: u64) -> bool {
+        self.active() == Some(client_id)
+    }
+
+    fn has_other_than(&self, client_id: u64) -> bool {
+        self.clients.iter().any(|&id| id != client_id)
+    }
+
+    fn others(&self, client_id: u64) -> Vec<u64> {
+        self.clients
+            .iter()
+            .copied()
+            .filter(|&id| id != client_id)
+            .collect()
+    }
+
+    /// Adds a client. Only the first client of a terminal becomes active on
+    /// joining; a later one ranks just below the active client.
+    fn join(&mut self, client_id: u64) {
+        if self.contains(client_id) {
+            return;
+        }
+        let position = self.clients.len().saturating_sub(1);
+        self.clients.insert(position, client_id);
+    }
+
+    /// Makes an attached client the active one. Returns true when the active
+    /// client changed.
+    fn activate(&mut self, client_id: u64) -> bool {
+        let Some(position) = self.clients.iter().position(|&id| id == client_id) else {
+            return false;
+        };
+        if position + 1 == self.clients.len() {
+            return false;
+        }
+        self.clients.remove(position);
+        self.clients.push(client_id);
+        true
+    }
+
+    /// Removes a client. Returns true when it was the active one.
+    fn remove(&mut self, client_id: u64) -> bool {
+        let Some(position) = self.clients.iter().position(|&id| id == client_id) else {
+            return false;
+        };
+        let was_active = position + 1 == self.clients.len();
+        self.clients.remove(position);
+        was_active
+    }
 }
 
 #[cfg(windows)]
@@ -970,13 +1043,7 @@ impl HeadlessServer {
             self.release_client_shell_inputs(client_id, held_inputs);
             crate::server::clipboard_image::remove_files(removed.staged_clipboard_files);
             if let ClientConnectionMode::TerminalAttach { terminal_id } = removed.mode {
-                self.terminal_attach_owners.remove(&terminal_id);
-                if let Some(terminal_id) = self.terminal_id_by_string(&terminal_id) {
-                    self.app
-                        .state
-                        .direct_attach_resize_locks
-                        .remove(&terminal_id);
-                }
+                self.release_terminal_attach_client(&terminal_id, client_id);
             }
         }
         if should_release_focus {
@@ -1025,13 +1092,110 @@ impl HeadlessServer {
         }
     }
 
+    /// Drops one direct attach client of a terminal. The size lock lasts until
+    /// the last client leaves; when the active client leaves earlier, the most
+    /// recently active remaining client takes over and the terminal follows
+    /// its size.
+    fn release_terminal_attach_client(&mut self, terminal_id: &str, client_id: u64) {
+        let Some(attached) = self.terminal_attach_owners.get_mut(terminal_id) else {
+            return;
+        };
+        let was_active = attached.remove(client_id);
+        if attached.is_empty() {
+            self.terminal_attach_owners.remove(terminal_id);
+            if let Some(terminal_id) = self.terminal_id_by_string(terminal_id) {
+                self.app
+                    .state
+                    .direct_attach_resize_locks
+                    .remove(&terminal_id);
+            }
+            return;
+        }
+        if was_active {
+            if let Some(next_active) = attached.active() {
+                info!(client_id = next_active, terminal_id = %terminal_id, "terminal attach control passed to remaining client");
+                self.resize_terminal_to_attach_client(terminal_id, next_active);
+            }
+        }
+    }
+
+    /// Whether any writable direct attach client holds the terminal.
+    fn terminal_has_attach_client(&self, terminal_id: &str) -> bool {
+        self.terminal_attach_owners
+            .get(terminal_id)
+            .is_some_and(|attached| !attached.is_empty())
+    }
+
+    /// Resizes a terminal to one of its direct attach clients and repaints
+    /// every direct stream client of that terminal when the grid changed.
+    fn resize_terminal_to_attach_client(&mut self, terminal_id: &str, client_id: u64) {
+        let Some(client) = self.clients.get(&client_id) else {
+            return;
+        };
+        let (cols, rows) = client.terminal_size;
+        let cell_size = client.cell_size;
+        let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) else {
+            return;
+        };
+        let before = runtime.current_size();
+        runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
+        if runtime.current_size() == before {
+            return;
+        }
+        for stream_client_id in terminal_stream_client_ids(&self.clients, terminal_id) {
+            if let Some(stream_client) = self.clients.get_mut(&stream_client_id) {
+                stream_client.request_repaint();
+            }
+        }
+    }
+
+    /// Input from a direct attach client makes it the active client of its
+    /// terminal, so the terminal follows the size of the device in use.
+    fn activate_terminal_attach_client(&mut self, client_id: u64) {
+        let Some(ClientConnection {
+            mode: ClientConnectionMode::TerminalAttach { terminal_id },
+            ..
+        }) = self.clients.get(&client_id)
+        else {
+            return;
+        };
+        let terminal_id = terminal_id.clone();
+        let Some(attached) = self.terminal_attach_owners.get_mut(&terminal_id) else {
+            return;
+        };
+        if !attached.contains(client_id) {
+            return;
+        }
+        if attached.activate(client_id) {
+            debug!(client_id, terminal_id = %terminal_id, "terminal attach client became active");
+        }
+        self.resize_terminal_to_attach_client(&terminal_id, client_id);
+    }
+
     fn remove_client_and_resize_if_needed(&mut self, client_id: u64) {
-        let restore_shell_controller = self.clients.get(&client_id).and_then(|client| {
-            let ClientConnectionMode::TerminalAttach { terminal_id } = &client.mode else {
-                return None;
-            };
-            self.shell_geometry_controller_for_terminal(terminal_id)
-        });
+        let attach_terminal_id =
+            self.clients
+                .get(&client_id)
+                .and_then(|client| match &client.mode {
+                    ClientConnectionMode::TerminalAttach { terminal_id } => {
+                        Some(terminal_id.clone())
+                    }
+                    _ => None,
+                });
+        if let Some(terminal_id) = attach_terminal_id.as_deref() {
+            let other_attach_clients_remain = self
+                .terminal_attach_owners
+                .get(terminal_id)
+                .is_some_and(|attached| attached.has_other_than(client_id));
+            if other_attach_clients_remain {
+                // The remaining attach clients keep the terminal's size lock.
+                self.remove_client(client_id);
+                return;
+            }
+        }
+        let restore_shell_controller = attach_terminal_id
+            .as_deref()
+            .and_then(|terminal_id| self.shell_geometry_controller_for_terminal(terminal_id));
         self.remove_client(client_id);
         if let Some((controller_id, target)) = restore_shell_controller {
             self.restore_shell_tab_geometry(controller_id, target);
@@ -1173,6 +1337,7 @@ impl HeadlessServer {
     ) -> bool {
         match target {
             protocol::ClientClipboardImageTarget::DirectTerminal => {
+                self.activate_terminal_attach_client(client_id);
                 let Some(ClientConnection {
                     mode: ClientConnectionMode::TerminalAttach { terminal_id },
                     ..
@@ -1375,6 +1540,15 @@ impl HeadlessServer {
     ) -> bool {
         if self.handoff_in_progress {
             return false;
+        }
+        // A click or drag claims the terminal size; hover, release and wheel
+        // input do not, so moving the pointer over a passive device's window
+        // leaves the size with the device in use.
+        if matches!(
+            kind,
+            protocol::ClientMouseKind::Down(_) | protocol::ClientMouseKind::Drag(_)
+        ) {
+            self.activate_terminal_attach_client(client_id);
         }
         let Some(client) = self.clients.get(&client_id) else {
             return false;
@@ -1784,27 +1958,20 @@ impl HeadlessServer {
             return false;
         }
 
-        if let Some(existing_owner) = self.terminal_attach_owners.get(&terminal_id).copied() {
-            if existing_owner != client_id && !takeover {
+        if takeover {
+            let existing_clients = self
+                .terminal_attach_owners
+                .get(&terminal_id)
+                .map(|attached| attached.others(client_id))
+                .unwrap_or_default();
+            for existing_client in existing_clients {
                 self.send_to_client(
-                    client_id,
-                    ServerMessage::ServerShutdown {
-                        reason: Some(format!(
-                            "terminal attach failed: terminal {terminal_id} already has an attached client; retry with --takeover"
-                        )),
-                    },
-                );
-                self.remove_client_and_resize_if_needed(client_id);
-                return false;
-            }
-            if existing_owner != client_id {
-                self.send_to_client(
-                    existing_owner,
+                    existing_client,
                     ServerMessage::ServerShutdown {
                         reason: Some("terminal attach taken over".to_owned()),
                     },
                 );
-                self.remove_client_and_resize_if_needed(existing_owner);
+                self.remove_client_and_resize_if_needed(existing_client);
             }
         }
 
@@ -1824,17 +1991,32 @@ impl HeadlessServer {
             self.promote_latest_remaining_client();
         }
 
-        info!(client_id, cols, rows, terminal_id = %terminal_id, "terminal attach client connected");
-        self.terminal_attach_owners
-            .insert(terminal_id.clone(), client_id);
+        let attached = self
+            .terminal_attach_owners
+            .entry(terminal_id.clone())
+            .or_default();
+        let first_client = attached.is_empty();
+        attached.join(client_id);
+        info!(
+            client_id,
+            cols,
+            rows,
+            terminal_id = %terminal_id,
+            first_client,
+            "terminal attach client connected"
+        );
         self.app
             .state
             .direct_attach_resize_locks
             .insert(real_terminal_id.clone());
-        self.app
-            .start_pending_agent_resume_for_terminal(&real_terminal_id, rows, cols, true);
-        if let Some(runtime) = self.app.terminal_runtimes.get(&real_terminal_id) {
-            runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
+        // A later client joins at the size the terminal already has; it takes
+        // the terminal's size only once it sends input.
+        if first_client {
+            self.app
+                .start_pending_agent_resume_for_terminal(&real_terminal_id, rows, cols, true);
+            if let Some(runtime) = self.app.terminal_runtimes.get(&real_terminal_id) {
+                runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
+            }
         }
         true
     }
@@ -2090,6 +2272,15 @@ impl HeadlessServer {
                     );
                     return false;
                 }
+                if !matches!(
+                    self.clients.get(&client_id).map(|client| &client.mode),
+                    Some(ClientConnectionMode::TerminalAttach { .. })
+                ) {
+                    return false;
+                }
+                if terminal_attach_input_claims_size(&data) {
+                    self.activate_terminal_attach_client(client_id);
+                }
                 let Some(ClientConnection {
                     mode: ClientConnectionMode::TerminalAttach { terminal_id },
                     ..
@@ -2202,8 +2393,16 @@ impl HeadlessServer {
                     None
                 };
                 if let Some((terminal_id, cell_size)) = direct_terminal_id {
-                    if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
-                        runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
+                    // Only the active attach client drives the terminal size;
+                    // the others keep their size until they send input.
+                    let drives_size = self
+                        .terminal_attach_owners
+                        .get(&terminal_id)
+                        .is_some_and(|attached| attached.is_active(client_id));
+                    if drives_size {
+                        if let Some(runtime) = self.runtime_for_terminal_id_string(&terminal_id) {
+                            runtime.resize(rows, cols, cell_size.width_px, cell_size.height_px);
+                        }
                     }
                     return true;
                 }
@@ -2754,9 +2953,7 @@ impl HeadlessServer {
         }
         let lines = lines.unwrap_or(80).min(1000) as usize;
         if lines == 0
-            || self
-                .terminal_attach_owners
-                .contains_key(target.terminal_id.as_str())
+            || self.terminal_has_attach_client(target.terminal_id.as_str())
             || self
                 .pending_alt_screen_reads
                 .iter()
@@ -2802,9 +2999,7 @@ impl HeadlessServer {
                 .terminals
                 .get(&read.terminal_id)
                 .is_some_and(|terminal| terminal.state == crate::detect::AgentState::Idle);
-            let attached = self
-                .terminal_attach_owners
-                .contains_key(read.terminal_id.as_str());
+            let attached = self.terminal_has_attach_client(read.terminal_id.as_str());
             let outcome = if remains_idle && !attached {
                 read.poll(runtime, now)
             } else {
@@ -3390,6 +3585,13 @@ fn client_pane_input_releases_press(event: &protocol::ClientPaneInputEvent) -> b
             ..
         }
     )
+}
+
+/// Direct attach input claims the terminal size unless it is only a focus
+/// report, which a host terminal sends on its own when its window gains or
+/// loses focus.
+fn terminal_attach_input_claims_size(data: &[u8]) -> bool {
+    !matches!(data, b"\x1b[I" | b"\x1b[O")
 }
 
 fn client_pane_input_has_interaction(events: &[protocol::ClientPaneInputEvent]) -> bool {
