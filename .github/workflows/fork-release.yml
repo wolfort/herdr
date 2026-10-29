@@ -1,7 +1,7 @@
 name: Fork release
 
 # Manual release of the fork. Rebases the `fork` branch onto an upstream tag,
-# tests, builds macOS arm64 and Windows x64, and publishes a GitHub release
+# tests, builds Linux x86_64, macOS arm64 and Windows x64, and publishes a GitHub release
 # `vX.Y.Z-fork.N` with the binaries and the `latest.json` manifest that
 # `herdr update` reads. A rebase conflict fails the run before anything is
 # published.
@@ -196,6 +196,9 @@ jobs:
       fail-fast: true
       matrix:
         include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: herdr-linux-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
             name: herdr-macos-aarch64
@@ -260,7 +263,7 @@ jobs:
         run: |
           set -euo pipefail
           cp target/${{ matrix.target }}/release/herdr ${{ matrix.name }}
-          # The macOS runner can run the arm64 binary it just built.
+          # Each non-Windows runner can run the binary it just built.
           version="$(./${{ matrix.name }} --version | tr -d '\r')"
           case "$version" in
             *"$RELEASE_VERSION"*) ;;
@@ -348,7 +351,7 @@ jobs:
           {
             echo "Fork of herdr ${UPSTREAM_TAG} (commit ${RELEASE_COMMIT:0:12}) that lets several clients attach to one terminal."
             echo
-            echo "Binaries: macOS arm64 and Windows x64. \`herdr update\` on the fork reads \`latest.json\` from the latest release."
+            echo "Binaries: Linux x86_64, macOS arm64 and Windows x64. \`herdr update\` on the fork reads \`latest.json\` from the latest release."
           } > "$RUNNER_TEMP/notes.md"
           export BASE_URL="$base_url" PROTOCOL="$protocol" GENERATION="$generation" NOTES_PATH="$RUNNER_TEMP/notes.md" ASSETS_DIR="$RUNNER_TEMP/assets" MANIFEST_PATH="$RUNNER_TEMP/latest.json"
           python3 - <<'PY'
@@ -359,6 +362,7 @@ jobs:
 
           assets_dir = pathlib.Path(os.environ["ASSETS_DIR"])
           files = {
+              "linux-x86_64": "herdr-linux-x86_64",
               "macos-aarch64": "herdr-macos-aarch64",
               "windows-x86_64": "herdr-windows-x86_64.zip",
           }
@@ -405,6 +409,7 @@ jobs:
             --latest \
             --title "$RELEASE_TAG" \
             --notes-file "$RUNNER_TEMP/notes.md" \
+            "$RUNNER_TEMP/assets/herdr-linux-x86_64" \
             "$RUNNER_TEMP/assets/herdr-macos-aarch64" \
             "$RUNNER_TEMP/assets/herdr-windows-x86_64.zip" \
             "$RUNNER_TEMP/latest.json"
